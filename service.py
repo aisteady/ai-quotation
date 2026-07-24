@@ -16,10 +16,11 @@ import uuid
 from typing import Any
 
 from config import settings, validate_settings
+from config_engine import build_configuration, enrich_overview_with_llm, format_proposal_text
 from experience import ConfigExperienceService
 from graph.build import build_graph
 from harness import HarnessLoop, QuotationHarness
-from schemas import InquirySlots
+from schemas import SLOT_LABELS, InquirySlots
 from slots import SlotLLM, heuristic_extract, merge_slots
 from store import QuotationStore
 
@@ -148,6 +149,93 @@ class QuotationService:
         self, thread_id: str, quote: dict[str, Any]
     ) -> dict[str, Any]:
         return self.resume_human_config(thread_id, quote)
+
+    def recommend_for_customer(
+        self,
+        *,
+        query: str = "",
+        extras: str = "",
+        slots: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        供智能客服同步调用：抽槽 → 校验五要素 → 生成配置方案正文。
+
+        不走 LangGraph 人审 interrupt；缺参时返回 missing，由客服 Clarify 追问。
+        """
+        prior = InquirySlots.model_validate(slots or {})
+        blob = "\n".join(x for x in [(query or "").strip(), (extras or "").strip()] if x)
+        extract = self._make_extract_fn()
+        merged = extract(blob, prior) if blob else prior
+        if slots:
+            # 显式 slots 覆盖抽槽结果（多轮客服回传的已填项）
+            merged = merge_slots(merged, InquirySlots.model_validate(slots))
+
+        missing = merged.missing_required()
+        slots_partial = merged.model_dump(mode="json", exclude_none=True)
+        if missing:
+            labels = [SLOT_LABELS.get(m, m) for m in missing]
+            return {
+                "ok": False,
+                "error": "missing_required_slots",
+                "missing": missing,
+                "missing_labels": labels,
+                "clarify_question": merged.clarify_prompt(),
+                "slots_partial": slots_partial,
+                "proposal_text": "",
+                "structured": None,
+            }
+
+        snippets: list[dict[str, Any]] = []
+        search = self._make_search_fn()
+        if search:
+            q = " ".join(
+                x
+                for x in [
+                    merged.material,
+                    merged.fineness,
+                    merged.capacity,
+                    merged.equipment_name,
+                    "配置 选型",
+                ]
+                if x
+            ).strip()
+            if q:
+                try:
+                    snippets = search(q)[: settings.top_k]
+                except Exception as exc:
+                    logger.warning("recommend 检索失败: %s", exc)
+
+        proposal = build_configuration(merged, kb_snippets=snippets)
+        if settings.project_id:
+            proposal = enrich_overview_with_llm(
+                proposal,
+                project_id=settings.project_id,
+                model=settings.llm_model or None,
+            )
+        applied_meta: list[dict[str, Any]] = []
+        try:
+            proposal, applied = self.experience.retrieve_and_apply(merged, proposal)
+            applied_meta = [a.model_dump(mode="json") for a in applied]
+        except Exception as exc:
+            logger.warning("recommend 套用经验失败: %s", exc)
+
+        text = format_proposal_text(proposal)
+        self.harness.emit(
+            "customer_recommend_ok",
+            lines=len(proposal.line_items),
+            material=merged.material,
+        )
+        return {
+            "ok": True,
+            "error": "",
+            "missing": [],
+            "missing_labels": [],
+            "clarify_question": "",
+            "slots_partial": slots_partial,
+            "proposal_text": text,
+            "structured": proposal.model_dump(mode="json"),
+            "applied_experiences": applied_meta,
+        }
 
     def get_state(self, thread_id: str) -> dict[str, Any]:
         config = {"configurable": {"thread_id": thread_id}}

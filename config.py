@@ -123,6 +123,12 @@ class Settings:
         env("EXPERIENCE_APPLY_THRESHOLD", "0.35") or "0.35"
     )
 
+    # ---- 对智能客服开放的同步推荐 HTTP ----
+    customer_api_host: str = env("CUSTOMER_API_HOST", "0.0.0.0")
+    customer_api_port: int = int(env("CUSTOMER_API_PORT", "8510") or "8510")
+    # 空 = 开发可不鉴权；生产建议配置
+    customer_api_token: str = env("CUSTOMER_API_TOKEN")
+
     # ---- 数据库 ----
     database_url: str = env("DATABASE_URL")
     db_host: str = env("DB_HOST", "localhost")

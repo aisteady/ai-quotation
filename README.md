@@ -1,300 +1,295 @@
-# AI 工艺选型配置系统（ai_quotation）
+# 工艺选型配置系统（ai_quotation）
 
-> **主目标：** 根据工艺五要素及其他信息，自动生成 **详细配置清单（BOM）** 与 **设备配置参数**，经人工审核确认后落库。  
-> **工程重点：** **Agent Harness**（守卫 + 审计）+ **双 Loop**（Clarify 补全 / 待审扫描）+ **选型经验闭环**（人审反馈 → 归纳 → 下次自动套用）。  
-> **大模型：** 经上游 AI 数据中台 MCP `chat_completion` 调用（密钥与型号在中台配置，本应用不持有 `DASHSCOPE_API_KEY`）。
+> **一句话**：根据工艺「五要素」等信息，自动生成设备配置方案（配置清单 / 参数），并可给人审核、沉淀经验。  
+> 智能客服在对话里问选型时，会 **HTTP 调用** 本系统的推荐接口；**缺什么参数由本系统判定**，客服负责向用户追问。
 
-目录名 `ai_quotation` 保留兼容；产品语义是 **工艺选型配置**，不是自动商务报价。
-
-本目录可整体拷贝为独立仓库，不依赖中台源码，仅依赖已启动的中台 **MCP / API** 与 **PostgreSQL**。
+目录名 `ai_quotation` 是历史名字；产品语义是 **工艺选型配置**，不是自动算出商务报价单。  
+报价意向（姓名、电话）由 **智能客服** 收集，不走本系统人审页。
 
 ---
 
 ## 目录
 
-1. [项目亮点](#1-项目亮点)
-2. [业务背景与目标](#2-业务背景与目标)
-3. [技术栈](#3-技术栈)
-4. [系统架构](#4-系统架构)
-5. [Harness 与双 Loop](#5-harness-与双-loop)
-6. [选型经验闭环](#6-选型经验闭环)
-7. [流水线与五要素](#7-流水线与五要素)
-8. [模块说明](#8-模块说明)
-9. [存储设计](#9-存储设计)
-10. [与 AI 数据中台的边界](#10-与-ai-数据中台的边界)
-11. [环境配置](#11-环境配置)
-12. [快速开始](#12-快速开始)
-13. [演示路径](#13-演示路径)
-14. [常见问题](#14-常见问题)
-15. [简历描述参考](#15-简历描述参考)
+1. [它解决什么问题](#1-它解决什么问题)
+2. [和智能客服怎么分工](#2-和智能客服怎么分工)
+3. [什么是「五要素」](#3-什么是五要素)
+4. [两种用法：工作台 vs 客服 API](#4-两种用法工作台-vs-客服-api)
+5. [第一次跑起来](#5-第一次跑起来)
+6. [推荐 API 怎么用（给联调者）](#6-推荐-api-怎么用给联调者)
+7. [系统内部大概怎么跑](#7-系统内部大概怎么跑)
+8. [环境变量](#8-环境变量)
+9. [目录结构](#9-目录结构)
+10. [常见问题](#10-常见问题)
+11. [术语小词典](#11-术语小词典)
 
 ---
 
-## 1. 项目亮点
+## 1. 它解决什么问题
 
-| 优先级 | 亮点 | 说明 |
-|--------|------|------|
-| ★★★ | **配置清单 + 设备参数** | 主交付：BOM 式配套清单与主机/系统关键参数表 |
-| ★★★ | **选型经验闭环** | 人审自然语言修订 → 结构化经验 → 下次生成自动套用 |
-| ★★★ | **Agent Harness** | `wrap_run` 审计、追问轮数硬顶、事件落 `harness_events` |
-| ★★★ | **双 Loop** | Clarify Loop 问全五要素；HarnessLoop 扫待审配置积压 |
-| ★★ | **人机协同** | LangGraph `interrupt`：确认 / 自然语言修订 / 拒绝 |
-| ★★ | **规则可演示** | 无 LLM 也能出完整清单；有 MCP 可润色/抽槽/归纳经验 |
-| ★★ | **MCP 解耦** | 检索 + 大模型统一走中台；Token 按项目计量 |
-| ★ | **领域术语** | d95/D95 = 通筛率，不是细度；细度用目数/D50 |
+工业磨粉/粉体设备选型时，销售或工艺人员需要根据：
 
----
+- 加工什么物料  
+- 要多细（细度）  
+- 通筛率要求  
+- 产量  
+- 进料尺寸  
+- …以及含水、硬度等补充信息  
 
-## 2. 业务背景与目标
-
-粉体设备选型高度依赖人工经验：客户用自然语言描述物料、细度、产量、进料尺寸等，工程师再手工拼配置清单。易漏项、口径不一，经验难以复用。
+才能给出较靠谱的设备配置。
 
 本系统目标：
 
-1. 用自然语言采集 **工艺五要素**（缺则 Clarify Loop 追问）；
-2. 规则引擎生成 **配置清单 + 设备参数** 初稿；
-3. 人工审核可用自然语言指出不合理处（如「入料已达磨机要求，不用加破碎机」）；
-4. 系统把意见沉淀为经验，后续同类条件自动改清单；
-5. 与知识中台解耦：检索/大模型走 MCP，业务表落独立 PostgreSQL Schema。
+1. **自动生成**详细配置说明（规则引擎为主，可结合知识库/大模型）  
+2. **工程师工作台**里可多轮补参、人工审核、改判  
+3. **把人审结论沉淀为经验**，下次相似需求可自动参考  
+4. **给智能客服一条同步 HTTP 捷径**：对话中快速要方案，不走进人审打断流程  
+
+大模型调用走 **中台 MCP**（本应用不持有 `DASHSCOPE_API_KEY`）。
 
 ---
 
-## 3. 技术栈
+## 2. 和智能客服怎么分工
 
-| 层级 | 技术 | 用途 |
-|------|------|------|
-| UI | Streamlit | 需求对话 / 配置审核 / 历史 / 选型经验 |
-| 编排 | LangGraph + Postgres Checkpoint | 有状态流程、interrupt 人审恢复 |
-| 守卫 | 自研 QuotationHarness / HarnessLoop | 审计、轮数硬顶、待审扫描 |
-| 生成 | `config_engine` 规则引擎 | 无 LLM 也可出清单 |
-| 协议 | MCP Streamable HTTP | `search_documents` / `chat_completion` |
-| 存储 | PostgreSQL | `ai_inquiry_quotation` schema |
-| 配置 | python-dotenv | 本目录 `.env` + 可选继承中台根 `.env` |
+请牢记这一句：
 
----
+> **客服问人，本系统判齐并出方案；要留资找销售由客服负责。**
 
-## 4. 系统架构
+| 系统 | 负责 | 不负责 |
+|------|------|--------|
+| **本系统** | 五要素校验；生成配置方案；工程师人审与经验学习；`/api/v1/recommend` | 客服聊天 UI；CRM 留资字段；公司报价审批流 |
+| **智能客服** | 多轮对话、把缺失项问出来、展示方案、询问是否报价并写线索 | 另搞一套五要素规则；在客服里做人审 BOM |
+
+时序（客服调用时）：
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│  Streamlit（:8504）                                           │
-│  需求对话 │ 配置审核 │ 历史方案 │ 选型经验                      │
-└────────────────────────────┬─────────────────────────────────┘
-                             ▼
-┌──────────────────────────────────────────────────────────────┐
-│  QuotationService + QuotationHarness.wrap_run                 │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │ LangGraph                                               │  │
-│  │ parse → Clarify↺ → generate_config(+经验召回)            │  │
-│  │        → human_review → finalize(+经验学习) → END        │  │
-│  └────────────────────────────────────────────────────────┘  │
-│  HarnessLoop（可选）：扫描 pending_human                       │
-└───────────────┬─────────────────────────────┬────────────────┘
-                │ MCP                         │ SQL
-                ▼                             ▼
-     ┌──────────────────┐          ┌──────────────────────┐
-     │ AI 数据中台 MCP   │          │ PostgreSQL           │
-     │ search / chat    │          │ inquiries / configs  │
-     │ completion       │          │ experiences / events │
-     └──────────────────┘          │ + LangGraph CKPT     │
-                                   └──────────────────────┘
+用户在客服里描述需求
+  → 客服工具 process_config_recommend
+  → POST 本系统 /api/v1/recommend
+       ├─ 缺五要素 → 返回 missing + clarify_question
+       │     → 客服向用户追问 → 再 POST（带上已收集 slots）
+       └─ 齐全 → 返回 proposal_text + structured
+             → 客服展示方案 →（可选）报价留资
 ```
 
 ---
 
-## 5. Harness 与双 Loop
+## 3. 什么是「五要素」
 
-```text
-┌────────────────────────────────────────────┐
-│  HarnessLoop：定时扫描 pending_human       │
-├────────────────────────────────────────────┤
-│  QuotationHarness：wrap_run / 轮数守卫     │
-├────────────────────────────────────────────┤
-│  Clarify Loop：补全五要素                   │
-│  → generate_config(+经验) → 人审 → 学习落库 │
-└────────────────────────────────────────────┘
-```
+推荐接口认为「必填」的核心槽位通常包括：
 
-| 组件 | 作用 |
-|------|------|
-| **Clarify Loop** | 缺五要素 → interrupt 追问 → 补充 → 再解析 |
-| **QuotationHarness** | 所有 start/resume 经 `wrap_run`；事件含 `config_generated` / `experience_applied` / `experience_learned` / `configured` |
-| **HarnessLoop** | `HARNESS_LOOP_INTERVAL_SEC>0` 时后台扫待审 |
+| 槽位（概念） | 含义 | 注意 |
+|--------------|------|------|
+| 加工物料 | 原料是什么 | 如石英砂、矿渣 |
+| 成品细度 | 要磨到多细 | 目数 / D50 等；**不要和 d95 搞混** |
+| 通筛率 | 过筛比例要求 | 常与 d95/D95 相关 |
+| 产量 | 产能 | 单位要说清 |
+| 进料尺寸 | 原料颗粒大小 | |
 
-配置：`MAX_CLARIFY_LOOPS`、`HARNESS_LOOP_INTERVAL_SEC`。
+选填：含水、硬度、电源、倾向机型等。
+
+术语提醒（客服提示词里也写了）：
+
+- **d95 / D95** 多表示通筛相关，不要当成「细度」去追问  
 
 ---
 
-## 6. 选型经验闭环
+## 4. 两种用法：工作台 vs 客服 API
 
-对应场景：人工发现方案不合理（例如入料 6mm 已达磨机要求，清单仍有破碎机）→ 审核页写修订意见 → 归纳为规则 → 后续同类条件自动改清单。
+| 入口 | 端口（默认） | 给谁 | 特点 |
+|------|--------------|------|------|
+| Streamlit 工作台 `start.py` | **8504** | 工艺/销售工程师 | 完整流程：补参、生成、**人审 interrupt**、经验学习 |
+| FastAPI `api.py` | **8510** | 智能客服 | 同步推荐；**不进入**人审断点；缺参就返回 missing |
 
-```text
-人审修订意见
-    ↓ learn_from_feedback（MCP LLM，失败则启发式）
-config_experiences（条件 + 动作）
-    ↓ 下次 generate_config 后 retrieve_and_apply
-改写 line_items / warnings / 参数
-```
-
-### 动作类型
-
-| `action_type` | 含义 | 示例 |
-|---------------|------|------|
-| `remove_line` | 去掉匹配清单行 | 目标 `破碎\|预碎\|颚破` |
-| `add_warning` | 写入方案警告 | d95 是通筛率不是细度 |
-| `set_param` | 改写设备参数键值 | 功率 / 风量等 |
-| `note` | 仅记经验，生成时提示 | 暂无强动作的意见 |
-
-### 召回打分（可解释，非向量）
-
-- 约 70%：条件文本关键词 Jaccard  
-- 约 25%：`slot_hints` 与当前槽位命中  
-- 约 20% 加分：`remove_line` 且当前清单已出现目标设备  
-
-≥ `EXPERIENCE_APPLY_THRESHOLD`（默认 **0.35**）则套用。  
-硬约束：「去掉破碎」类经验仅在 **入料 ≤15mm** 时生效。
+本地联调客服时，**至少要启动 `api.py`**。  
+工作台是给人用的，不是客服调用链路的必经之路。
 
 ---
 
-## 7. 流水线与五要素
+## 5. 第一次跑起来
 
-```text
-自然语言
-  → parse_slots（规则 + 可选 MCP LLM）
-  → 缺五要素？→ Clarify Loop …
-  → generate_config（规则清单 + 经验召回 + 可选 MCP/概述润色）
-  → human_review interrupt
-  → finalize（落库 + 经验学习）→ END
-```
+### 5.1 依赖
 
-| 必填字段 | 含义 |
-|----------|------|
-| `material` | 加工物料 |
-| `fineness` | 成品细度（目数 / D50；**不是 d95**） |
-| `sieve_pass_rate` | 通筛率（**含 d95/D95**） |
-| `capacity` | 产量 |
-| `feed_size` | 进料尺寸 |
+1. PostgreSQL（本应用使用独立 schema，默认 `ai_inquiry_quotation`）  
+2. 中台 API + MCP 已启动（若要用知识库检索 / LLM 增强）  
+3. Python + `uv`
 
-规则侧：进料 **>5mm** 时默认带「预破碎机」（偏保守），可被人审经验纠正。
-
----
-
-## 8. 模块说明
-
-| 文件 | 说明 |
-|------|------|
-| `app.py` | Streamlit：需求 / 审核 / 历史 / 选型经验 |
-| `service.py` | 对外门面 + 注入 Harness / 经验 / Graph |
-| `harness.py` | wrap_run、轮数守卫、HarnessLoop |
-| `config_engine.py` | 配置清单 + 设备参数规则生成 |
-| `experience.py` | 经验学习 / 召回 / 套用 |
-| `mcp_llm.py` | 封装中台 `chat_completion` |
-| `mcp_client.py` | MCP HTTP/TCP 客户端 |
-| `slots.py` | 五要素抽槽（启发式 + 可选 LLM） |
-| `schemas.py` / `store.py` / `db.py` | 模型、落库、连接 |
-| `graph/` | LangGraph 状态机 |
-| `start.py` | 启动入口（默认 :8504） |
-
----
-
-## 9. 存储设计
-
-Schema 默认 `ai_inquiry_quotation`（`APP_DB_SCHEMA`）：
-
-| 表 | 内容 |
-|----|------|
-| `inquiries` | 需求单、槽位、draft、状态 |
-| `configurations` | 人审确认后的正式清单与参数 |
-| `config_experiences` | 选型经验（条件、动作、命中次数） |
-| `messages` | 对话与系统消息 |
-| `harness_events` | 审计事件 |
-| LangGraph checkpoint | interrupt 恢复 |
-
----
-
-## 10. 与 AI 数据中台的边界
-
-| 中台负责 | 本应用负责 |
-|----------|------------|
-| 知识库检索 `search_documents` | 工艺对话、Clarify、配置生成 |
-| 大模型 `chat_completion`、型号、Token 计量 | 人审、经验库、业务 Schema |
-| 项目鉴权 / MCP 网关 | Streamlit 选型工作台 |
-
-**凭证：**
-
-- `MCP_CLIENT_TOKEN`：必须与中台 MCP 网关密钥一致（**不要**用项目 JWT 冒充）  
-- `SERVICE_TOKEN` / `API_BEARER_TOKEN`：仅用于直连中台 REST（可选）  
-- 大模型密钥只配在中台 `DASHSCOPE_API_KEY`
-
----
-
-## 11. 环境配置
+### 5.2 安装与配置
 
 ```bash
 cd models/ai_quotation
 cp .env.example .env
+# 填写：PROJECT_ID、MCP_URL、MCP_CLIENT_TOKEN、数据库等
+uv sync
 ```
 
-| 变量 | 含义 | 默认 |
-|------|------|------|
-| `PROJECT_ID` | 中台项目 UUID（检索与 Token 归属） | — |
-| `MCP_CLIENT_TOKEN` | MCP 网关 Bearer | — |
-| `MCP_URL` | MCP 地址 | `http://127.0.0.1:8765/mcp` |
-| `LLM_MODEL` | 可选覆盖型号；**留空用中台项目配置** | 空 |
-| `MAX_CLARIFY_LOOPS` | Clarify 最大轮数 | `5` |
-| `HARNESS_LOOP_INTERVAL_SEC` | 待审扫描间隔；`0`=关 | `0` |
-| `EXPERIENCE_APPLY_THRESHOLD` | 经验召回阈值 | `0.35` |
-| `APP_DB_SCHEMA` | 业务表 schema | `ai_inquiry_quotation` |
-| `PORT` | Streamlit 端口 | `8504` |
-
-修改代码后若 UI 行为未变，请重启进程（`st.cache_resource` 会缓存 Service）。
-
----
-
-## 12. 快速开始
-
-**前置：** 中台 API + MCP 已启动；PostgreSQL 可用；中台已配置 `DASHSCOPE_API_KEY`（若要用 LLM）。
+### 5.3 启动
 
 ```bash
-cd models/ai_quotation
-cp .env.example .env   # 填写 PROJECT_ID、MCP_CLIENT_TOKEN、DB
-uv sync                # 或 pip install -r requirements.txt
-uv run python start.py # http://localhost:8504
+# 给客服用的推荐 API（联调必开）
+uv run python api.py
+# http://0.0.0.0:8510  健康检查：GET /health
+
+# 工程师工作台（可选）
+uv run python start.py
+# http://localhost:8504
+```
+
+客服侧对应配置（在 `models/ai_customer/.env`）：
+
+```text
+PROCESS_CONFIG_URL=http://127.0.0.1:8510
+# PROCESS_CONFIG_TOKEN=   # 若本系统开了 CUSTOMER_API_TOKEN，则两边填一样
 ```
 
 ---
 
-## 13. 演示路径
+## 6. 推荐 API 怎么用（给联调者）
 
-1. **Clarify：** 故意漏一项五要素 → 看追问 → 补全。  
-2. **配置初稿：** 进料写 `6mm` → 「配置审核」可见预破碎机（规则偏保守）。  
-3. **经验学习：** 修订意见写「入料已达磨机要求，不用加破碎机」→ 确认 → 「选型经验」出现规则；本单破碎项被去掉。  
-4. **经验召回：** 再开一单进料 `6mm` → 生成后自动去掉预破碎；`40mm` 单仍保留。  
-5. **中台用量：** 在中台「大模型管理 → Token 用量」可见本项目消耗。  
+**接口：** `POST /api/v1/recommend`
 
----
+常见请求字段：
 
-## 14. 常见问题
-
-| 问题 | 处理 |
+| 字段 | 说明 |
 |------|------|
-| MCP 401 | 检查 `MCP_CLIENT_TOKEN` 是否与中台网关一致，勿填项目 SERVICE_TOKEN |
-| 有项目配置但型号仍不对 | 确认本应用 `.env` 未强制写死 `LLM_MODEL` |
-| 无 LLM 也能跑吗 | 可以：规则抽槽 + 规则出清单；经验归纳可走启发式 |
-| 提示词管理改了为何无效 | 选型用任务 prompt，不读中台「提示词管理」（该页主要服务客服） |
+| `query` | 用户问题或客服整理的短查询 |
+| `extras` | 追问过程中累积的补充说明 |
+| `slots` | 已识别/已填写的槽位（多轮回传） |
+| `session_id` | 可选，便于日志对齐 |
+
+若配置了 `CUSTOMER_API_TOKEN`，请求头需要：
+
+```text
+Authorization: Bearer <token>
+```
+
+**缺参时（示意）：**
+
+```json
+{
+  "ok": false,
+  "error": "missing_required_slots",
+  "missing": ["fineness", "capacity"],
+  "clarify_question": "请补充成品细度与产量要求",
+  "slots_partial": {}
+}
+```
+
+**齐全时（示意）：**
+
+```json
+{
+  "ok": true,
+  "proposal_text": "……可读的配置说明……",
+  "structured": {}
+}
+```
+
+客服拿到 `ok=false` 只会追问 `missing`，不会在客服里「发明」另一套校验规则。
 
 ---
 
-## 15. 简历描述参考
+## 7. 系统内部大概怎么跑
 
-**项目名称：** AI 工艺选型配置系统（Harness + 双 Loop + 经验闭环）
+### 7.1 工作台（完整图）
 
-**描述：**  
-面向粉体设备工艺选型，基于 LangGraph 采集工艺五要素，经 Clarify Loop 强制补全后，由规则引擎生成详细配置清单与设备参数；人工可用自然语言指出不合理处，系统归纳为选型经验并在后续单据自动召回套用。自研 Agent Harness 做入口审计与追问轮数守卫；检索与大模型经 MCP 对接中台，Token 按项目计量。将 Agent 从「能对话」提升为「可出配置、可纠偏学习、可控可观测」的线上能力。
+概念流程：
+
+```text
+收集/澄清五要素
+  → 生成配置（规则引擎 + 可选检索/LLM）
+  → 人工审核（可 interrupt 暂停等人）
+  → 确认后落库
+  → 人审反馈可写入「选型经验」，下次自动参考
+```
+
+外围有 **Harness**：限制循环次数、做审计，防止 Agent 乱跑。
+
+### 7.2 客服捷径
+
+`recommend_for_customer` 一类逻辑：  
+只做「判齐 → 出方案」，**跳过人审 interrupt**，以保证 HTTP 同步返回。
+
+### 7.3 经验闭环（工作台价值）
+
+1. 工程师改判 / 确认某次配置  
+2. 系统把可复用规则写入经验库  
+3. 下次相似输入达到阈值可自动套用或给出建议  
+
+这让系统越用越「像你们厂的真实口径」，而不是每次纯模型临场发挥。
 
 ---
 
-## License
+## 8. 环境变量
 
-与所属仓库 / 组织约定一致。
+详见 `.env.example`。新手优先关心：
+
+| 变量 | 含义 |
+|------|------|
+| `PROJECT_ID` | 中台知识库项目（检索用） |
+| `MCP_URL` / `MCP_CLIENT_TOKEN` | 连接中台 MCP |
+| `APP_DB_SCHEMA` | 默认 `ai_inquiry_quotation` |
+| `PORT` | 工作台端口，默认 8504 |
+| `CUSTOMER_API_HOST` / `CUSTOMER_API_PORT` | 推荐 API 监听，默认 8510 |
+| `CUSTOMER_API_TOKEN` | 推荐 API 鉴权（可选） |
+| `MAX_CLARIFY_LOOPS` | 工作台追问上限 |
+| `EXPERIENCE_APPLY_THRESHOLD` | 经验自动套用阈值 |
+
+数据库可用 `DATABASE_URL` 或 `DB_*`（常继承仓库根 `.env`）。
+
+---
+
+## 9. 目录结构
+
+```text
+ai_quotation/
+├── api.py              # 客服用的 FastAPI 推荐服务 :8510
+├── start.py / app.py   # Streamlit 工作台
+├── service.py          # 业务门面
+├── config_engine.py    # 配置生成核心
+├── slots.py            # 五要素槽位定义与处理
+├── experience.py       # 经验匹配与学习
+├── harness.py          # 护栏与审计
+├── graph/              # LangGraph 状态机（工作台流程）
+├── mcp_client.py / mcp_llm.py
+├── store.py / db.py / schemas.py
+└── .env.example
+```
+
+---
+
+## 10. 常见问题
+
+**Q：客服一直说工艺服务连不上？**  
+A：是否执行了 `uv run python api.py`？端口是否为 8510？客服 `PROCESS_CONFIG_URL` 是否写对？
+
+**Q：一直缺参数，追问很奇怪？**  
+A：看 API 返回的 `missing` 字段；检查用户是否把 d95 和细度说混；可在工作台用同一描述试一次对比。
+
+**Q：工作台能出方案，客服不行？**  
+A：客服走的是 `api.py` 捷径，不是工作台端口 8504；不要把 UI 地址填进 `PROCESS_CONFIG_URL`。
+
+**Q：需要大模型密钥吗？**  
+A：配在中台根 `.env`；本目录通过 MCP 调用。规则引擎在无 LLM 时仍可给基础方案（视实现与配置而定）。
+
+**Q：这是报价系统吗？**  
+A：不是商务自动报价。这里产出的是 **工艺/设备配置方案**；商务价格与合同由人工/其它系统处理，客服只收集「想报价」的线索。
+
+---
+
+## 11. 术语小词典
+
+| 词 | 白话解释 |
+|----|----------|
+| 五要素 / slots | 选型前必须齐的关键参数槽位 |
+| BOM / 配置清单 | 方案里列出的设备与配置项（工程含义，不是购物车） |
+| Clarify | 缺参时的追问补全 |
+| 人审 interrupt | 流程暂停，等工程师在页面确认后再继续 |
+| 经验库 | 历史人审沉淀下来的可复用规则/案例 |
+| Harness | 限制循环、记录审计的护栏 |
+| recommend API | 专供客服同步调用的推荐接口 |
+
+相关文档：
+
+- 数据中台：[../../README.md](../../README.md)  
+- 智能客服：[../ai_customer/README.md](../ai_customer/README.md)  
+- **客服 ↔ 本系统通信详解（代码 + 为何 HTTP）**：[../ai_customer/PROCESS_CONFIG_COMM.md](../ai_customer/PROCESS_CONFIG_COMM.md)  

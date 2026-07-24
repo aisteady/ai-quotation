@@ -256,6 +256,40 @@ def build_configuration(
     )
 
 
+def format_proposal_text(proposal: ConfigurationProposal) -> str:
+    """把配置方案格式化为客服可直接展示的正文。"""
+    lines: list[str] = [
+        f"【{proposal.title}】",
+        "",
+        proposal.overview or "",
+        "",
+        "一、配置清单",
+    ]
+    for it in proposal.line_items:
+        lines.append(
+            f"{it.item_no}. [{it.category}] {it.name}｜{it.model_spec} "
+            f"× {it.quantity}{it.unit}"
+        )
+        if it.remark:
+            lines.append(f"   备注：{it.remark}")
+    ep = proposal.equipment_params
+    lines.extend(["", "二、设备配置参数", f"主机型号建议：{ep.host_model or '—'}"])
+    for k, v in (ep.params or {}).items():
+        if v:
+            lines.append(f"- {k}：{v}")
+    if ep.notes:
+        lines.append(f"- 其他说明：{ep.notes}")
+    if proposal.process_basis:
+        lines.extend(["", f"工艺依据：{proposal.process_basis}"])
+    if proposal.warnings:
+        lines.extend(["", "三、注意事项"])
+        for w in proposal.warnings:
+            lines.append(f"- {w}")
+    if proposal.caution:
+        lines.extend(["", proposal.caution])
+    return "\n".join(lines).strip()
+
+
 def enrich_overview_with_llm(
     proposal: ConfigurationProposal,
     *,
